@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@+id/rm_current" android:title="@string/remove_current_server" />
+    <item android:id="@+id/rms" android:title="@string/remove_stored_servers" />
+    <item android:id="@+id/rmc" android:title="@string/remove_all_known_sertificates" />
+</menu>
