@@ -35,16 +35,17 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.net.InetAddress;
+//import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.security.KeyStore;
-import java.security.cert.Certificate;
+//import java.security.cert.Certificate;
+import java.security.Security;
 import java.security.cert.CertificateException;
-import java.security.cert.CertificateFactory;
+//import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.util.Base64;
 import java.util.concurrent.TimeUnit;
@@ -60,6 +61,7 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
 import javax.security.auth.x500.X500Principal;
+import org.conscrypt.Conscrypt;
 
 public class SmallSrvVpnConnection implements Runnable {
     /**
@@ -130,6 +132,18 @@ public class SmallSrvVpnConnection implements Runnable {
     boolean msg_sendet = false;
     boolean LAN_only = false;
 
+    private static final String KEY_ALGORITHM = "RSA";
+    private static final int KEY_SIZE = 2048;
+    private static final String SIGNATURE_ALGORITHM = "SHA256WithRSA";
+    public static final String[] TLSv = {"TLS", "TLSv1.3", "TLSv1.2", "TLSv1.1"};
+
+    public  static final String[] enabledProtocols = {"TLSv1.3", "TLSv1.2"};
+    public  static int   workTLS = 0;
+    public  static int   TLStried = 0;
+    public  static final int TLSmask = 3;
+    public  static final int TriedMask = 0xF;
+    public static boolean provederUpdated = false;
+
     static long easyHash(byte[] src)
     {
       long r1 = 0;
@@ -158,21 +172,26 @@ public class SmallSrvVpnConnection implements Runnable {
         mSharedSecret = sharedSecret;
         LAN_only = lo;
 
+        String t;
         int b = serverName.indexOf("http://");
         if(b == 0)
-          serverName = serverName.substring(7);
-        b = serverName.indexOf("https://");
-        if(b == 0)
-          serverName = serverName.substring(8);
+          t = serverName.substring(7);
+        else {
+            b = serverName.indexOf("https://");
+            if (b == 0)
+                t = serverName.substring(8);
+            else
+                t = serverName;
+        }
 
-        b = serverName.indexOf('/');
+        b = t.indexOf('/');
         if(b<=0)
         {
             stop_thread = true;
             throw new IllegalArgumentException(serverName);
         }
-        mPatch = serverName.substring(b + 1 );
-        mServerName = serverName.substring(0, b);
+        mPatch = t.substring(b + 1 );
+        mServerName = t.substring(0, b);
         mServerPort = 443;
         if(mServerName.indexOf('[') == 0 )
         {
@@ -184,6 +203,11 @@ public class SmallSrvVpnConnection implements Runnable {
         if(b>0) {
             mServerPort = Integer.parseInt(mServerName.substring(b+1),10);
             mServerName = mServerName.substring(0, b);
+        }
+
+        if(!provederUpdated) {
+            Security.insertProviderAt(Conscrypt.newProvider(), 1);
+            provederUpdated = true;
         }
     }
 
@@ -206,7 +230,7 @@ public class SmallSrvVpnConnection implements Runnable {
             // network is available.
             // Here we just use a counter to keep things simple.
             msg_sendet = false;
-            for (int attempt = 0; attempt < 5 && ! stop_thread ; ++attempt) {
+            for (int attempt = 0; attempt < 9 && ! stop_thread ; ++attempt) {
                 // Reset the counter if we were connected.
                 socket = null;
                 if (run(0)) {
@@ -214,7 +238,8 @@ public class SmallSrvVpnConnection implements Runnable {
                 }
                 // Sleep for a while. This also checks if we got interrupted.
                 if(stop_thread) break;
-                Thread.sleep(3000);
+                if((TLStried & (1 << workTLS)) != 0)
+                   Thread.sleep(3000);
             }
             Log.i(getTag(), "Giving up");
         } catch (IOException | IllegalStateException | InterruptedException | IllegalArgumentException e) {
@@ -271,6 +296,7 @@ public class SmallSrvVpnConnection implements Runnable {
                 }
         };
     }
+
     class HTTPReq{
         public String req;
         HTTPReq(String p) {
@@ -356,30 +382,34 @@ public class SmallSrvVpnConnection implements Runnable {
     }
 
     private SSLSocketFactory getSSLSocketFactory() {
+      int n = 4 - workTLS;
+      while(n>0) {
+        n--;
         try {
-            CertificateFactory cf = CertificateFactory.getInstance("X.509");
-            InputStream caInput = mService.getResources().openRawResource(R.raw.ks);
-            Certificate ca = cf.generateCertificate(caInput);
-            caInput.close();
+          KeyStore keyStore = KeyStore.getInstance("BKS");
+          keyStore.load(null, null);
 
-            KeyStore keyStore = KeyStore.getInstance("BKS");
-            keyStore.load(null, null);
-            keyStore.setCertificateEntry("ca", ca);
+          String tmfAlgorithm = TrustManagerFactory.getDefaultAlgorithm();
+          TrustManagerFactory tmf = TrustManagerFactory.getInstance(tmfAlgorithm);
+          tmf.init(keyStore);
+          //Log.i(getTag(), "Lb gsf 1 " + tmfAlgorithm + " " + TLSv[workTLS]);
+          SSLContext sslContext = SSLContext.getInstance(TLSv[workTLS]);
 
-            String tmfAlgorithm = TrustManagerFactory.getDefaultAlgorithm();
-            TrustManagerFactory tmf = TrustManagerFactory.getInstance(tmfAlgorithm);
-            tmf.init(keyStore);
-            //Log.i(getTag(), "Lb gsf 1 " + tmfAlgorithm);
-            SSLContext sslContext = SSLContext.getInstance("TLS");
+          sslContext.init(null, getWrappedTrustManagers(tmf.getTrustManagers()), null);
 
-            sslContext.init(null, getWrappedTrustManagers(tmf.getTrustManagers()), null);
-
-            return sslContext.getSocketFactory();
+          return sslContext.getSocketFactory();
         } catch (Exception e) {
-            Log.i(getTag(), "gsf error: " + e.toString());
-            return HttpsURLConnection.getDefaultSSLSocketFactory();
+          Log.i(getTag(), "gsf error: " + e.toString());
+          if(workTLS == 0) {
+            workTLS=(workTLS + 1) & TLSmask;
+            Log.i(getTag(), "Try with " + TLSv[workTLS]);
+            continue ;
+          }
+          return HttpsURLConnection.getDefaultSSLSocketFactory();
         }
-    }
+      }
+      return HttpsURLConnection.getDefaultSSLSocketFactory();
+    };
 
     //private final Semaphore mSem = new Semaphore(0, false);
     public int E64X(int i)
@@ -429,196 +459,209 @@ public class SmallSrvVpnConnection implements Runnable {
         boolean ret = false;
         connected = false;
 
-        //Log.i(getTag(), "Lb 1 ");
-        // Create a https channel as the VPN tunnel.
+        TLStried |= (1<<workTLS);
+
+
+          //Log.i(getTag(), "Lb 1 ");
+          // Create a https channel as the VPN tunnel.
         try  {
-            //Log.i(getTag(), "Lb 2");
-            if( sslSocketFactory == null)
-            {
-                sslSocketFactory = getSSLSocketFactory();
+          //Log.i(getTag(), "Lb 2");
+          //if( sslSocketFactory == null)
+          {
+            sslSocketFactory = getSSLSocketFactory();
+          }
+
+          socket = new Socket();
+          socket.setKeepAlive(true);
+          socket.setTcpNoDelay(true);
+
+          Log.i(getTag(), "Connect... " + TLSv[workTLS] + " TLStried = " + TLStried );
+          socket.connect(new InetSocketAddress(mServerName, mServerPort), 5000);
+
+          sslSocket = (SSLSocket) sslSocketFactory.createSocket(socket, mServerName, mServerPort, false);
+
+          sslSocket.setEnabledProtocols(enabledProtocols);
+
+         // Log.i(getTag(), "Lb 2a");
+
+          HTTPReq tunel = new HTTPReq(mPatch);
+
+          tunel.setRequestProperty("Host", mServerName);
+          String userpass = new String(mUser + ":" + mSharedSecret);
+          if (Build.VERSION.SDK_INT >= 26 /*Build.VERSION_CODES.LOLLIPOP*/) {
+            tunel.setRequestProperty("Authorization", "Basic " + new String(Base64.getEncoder().encode(userpass.getBytes())));
+          }
+          else {
+            tunel.setRequestProperty("Authorization", "Basic " + new String( mEncode64(userpass)));
+          }
+
+          tunel.setRequestProperty("tun", "0");
+          if(ipv4 !=0 ) tunel.setRequestProperty("reconnect", String.format("%X",ipv4));
+
+         // Log.i(getTag(), "Lb 3");
+
+
+          // Connect to the server.
+          tunel.req += "\r\n";
+          sslSocket.setEnabledCipherSuites(sslSocket.getSupportedCipherSuites());
+          sslSocket.setEnabledProtocols(sslSocket.getSupportedProtocols());
+          sslSocket.setNeedClientAuth (false);
+          sslSocket.setUseClientMode (true);
+          sslSocket.setEnableSessionCreation (true);
+
+          //Log.i(getTag(), TextUtils.join(":",sslSocket.getEnabledCipherSuites() ));
+          //Log.i(getTag(), TextUtils.join(",",sslSocket.getEnabledProtocols() ));
+
+          sslSocket.addHandshakeCompletedListener(new HandshakeCompletedListener() {
+            @Override
+            public void handshakeCompleted(HandshakeCompletedEvent event) {
+              //Log.i(getTag(), "Lb 3a");
+              connected = true;
+            }
+          });
+
+          sslSocket.startHandshake();
+
+          //Log.i(getTag(), "Lb 4");
+
+          while(! connected )
+          {
+            Thread.sleep(200);
+            //Log.i(getTag(), "Lb 5");
+          }
+          if(stop_thread) return false;
+          //Log.i(getTag(), "Lb 6");
+          byte[] b_packet = new byte[MAX_PACKET_SIZE+2];
+          ByteBuffer s_packet = ByteBuffer.wrap(b_packet,0,MAX_PACKET_SIZE+2);
+          s_packet.order(ByteOrder.LITTLE_ENDIAN);
+
+          OutputStream s_out = sslSocket.getOutputStream();
+          InputStream s_in = sslSocket.getInputStream();
+          //Log.i(getTag(), "Lb 7");
+          s_out.write(tunel.req.getBytes());
+
+          Thread.sleep(1500);
+
+          code = s_in.read(b_packet);
+          //Log.i(getTag(), "Lb 9 "+ Integer.toString(code));
+          if(code > 0) {
+            tunel.req = new String(b_packet, 0, code);
+            //Log.i(getTag(), tunel.req);
+            String str = tunel.req.substring(9,12);
+            //Log.i(getTag(), "|" + str);
+            code = Integer.parseInt(str,10);
+          }
+          if( code != 200 ) {
+            if(code == 401) {
+              stop_thread = true;
+              mService.mHandler.sendEmptyMessage(R.string.bad_pass);
+              msg_sendet = true;
+            }
+            else if(code>=400) {
+              stop_thread = true;
+              mService.mHandler.sendEmptyMessage(code == 509 ? R.string.limover : R.string.bad_url);
+              msg_sendet = true;
             }
 
-            socket = new Socket();
-            socket.setKeepAlive(true);
-            socket.setTcpNoDelay(true);
+            Log.e(getTag(), String.format("Connection error %d", code));
+            return false;
+          }
+          //Log.i(getTag(), "Lb 10");
+          // Protect the tunnel before connecting to avoid loopback.
+          if (!mService.protect(socket)) {
+            throw new IllegalStateException("Cannot protect the tunnel");
+          }
 
-            Log.i(getTag(), "Connect...");
-            socket.connect(new InetSocketAddress(mServerName, mServerPort), 5000);
+          // Authenticate and configure the virtual network interface.
+          iface = configure(tunel);
 
-            sslSocket = (SSLSocket) sslSocketFactory.createSocket(socket, mServerName, mServerPort, false);
+          //Log.i(getTag(), "Lb 11");
 
-            //Log.i(getTag(), "Lb 2a");
+          // Packets to be sent are queued in this input stream.
+          FileInputStream in = new FileInputStream(iface.getFileDescriptor());
 
-            HTTPReq tunel = new HTTPReq(mPatch);
+          // Packets received need to be written to this output stream.
+          FileOutputStream out = new FileOutputStream(iface.getFileDescriptor());
 
-            tunel.setRequestProperty("Host", mServerName);
-            String userpass = new String(mUser + ":" + mSharedSecret);
-            if (Build.VERSION.SDK_INT >= 26 /*Build.VERSION_CODES.LOLLIPOP*/) {
-                tunel.setRequestProperty("Authorization", "Basic " + new String(Base64.getEncoder().encode(userpass.getBytes())));
+          s_packet.clear();
+
+          RecvThread thr = new  RecvThread(s_in, out);
+          ret = true;
+          thr.start();
+
+          while (socket.isConnected() && connected)
+          {
+            // Assume that we did not make any progress in this iteration.
+
+            // Read the outgoing packet from the input stream.
+            int length = in.read(b_packet,2,MAX_PACKET_SIZE);
+            if(stop_thread) break;
+            if (length > 0) {
+              // Write the outgoing packet to the tunnel.
+
+              s_packet.putShort(0,(short)length);
+              s_out.write(b_packet,0,length+2);
+              s_packet.clear();
+
+              // There might be more outgoing packets.
+
+              //Log.i(getTag(), String.format("out %d %d",length, out_counter));
+              out_counter ++;
+              out_bytes += length;
             }
-            else {
-                tunel.setRequestProperty("Authorization", "Basic " + new String( mEncode64(userpass)));
-            }
+          }
 
-            tunel.setRequestProperty("tun", "0");
-            if(ipv4 !=0 ) tunel.setRequestProperty("reconnect", String.format("%X",ipv4));
-
-            //Log.i(getTag(), "Lb 3");
-
-
-            // Connect to the server.
-            tunel.req += "\r\n";
-            sslSocket.setEnabledCipherSuites(sslSocket.getSupportedCipherSuites());
-            sslSocket.setEnabledProtocols(sslSocket.getSupportedProtocols());
-            sslSocket.setNeedClientAuth (false);
-            sslSocket.setUseClientMode (true);
-            sslSocket.setEnableSessionCreation (true);
-
-            //Log.i(getTag(), TextUtils.join(":",sslSocket.getEnabledCipherSuites() ));
-            //Log.i(getTag(), TextUtils.join(",",sslSocket.getEnabledProtocols() ));
-
-            sslSocket.addHandshakeCompletedListener(new HandshakeCompletedListener() {
-                                                   @Override
-                                                   public void handshakeCompleted(HandshakeCompletedEvent event) {
-                                                       //Log.i(getTag(), "Lb 3a");
-                                                       connected = true;
-                                                   }
-                                               });
-
-            sslSocket.startHandshake();
-
-            //Log.i(getTag(), "Lb 4");
-
-            while(! connected )
-            {
-                Thread.sleep(200);
-                //Log.i(getTag(), "Lb 5");
-            }
-            if(stop_thread) return false;
-            //Log.i(getTag(), "Lb 6");
-            byte[] b_packet = new byte[MAX_PACKET_SIZE+2];
-            ByteBuffer s_packet = ByteBuffer.wrap(b_packet,0,MAX_PACKET_SIZE+2);
-            s_packet.order(ByteOrder.LITTLE_ENDIAN);
-
-            OutputStream s_out = sslSocket.getOutputStream();
-            InputStream s_in = sslSocket.getInputStream();
-            //Log.i(getTag(), "Lb 7");
-            s_out.write(tunel.req.getBytes());
-
-            Thread.sleep(1500);
-
-            code = s_in.read(b_packet);
-            //Log.i(getTag(), "Lb 9 "+ Integer.toString(code));
-            if(code > 0) {
-                tunel.req = new String(b_packet, 0, code);
-                //Log.i(getTag(), tunel.req);
-                String str = tunel.req.substring(9,12);
-                //Log.i(getTag(), "|" + str);
-                code = Integer.parseInt(str,10);
-            }
-            if( code != 200 ) {
-              if(code == 401) {
-                  stop_thread = true;
-                  mService.mHandler.sendEmptyMessage(R.string.bad_pass);
-                  msg_sendet = true;
-              }
-              else if(code>=400) {
-                  stop_thread = true;
-                  mService.mHandler.sendEmptyMessage(code == 509 ? R.string.limover : R.string.bad_url);
-                  msg_sendet = true;
-              }
-
-              Log.e(getTag(), String.format("Connection error %d", code));
-              return false;
-            }
-            //Log.i(getTag(), "Lb 10");
-            // Protect the tunnel before connecting to avoid loopback.
-            if (!mService.protect(socket)) {
-                throw new IllegalStateException("Cannot protect the tunnel");
-            }
-
-            // Authenticate and configure the virtual network interface.
-            iface = configure(tunel);
-
-            //Log.i(getTag(), "Lb 11");
-
-            // Packets to be sent are queued in this input stream.
-            FileInputStream in = new FileInputStream(iface.getFileDescriptor());
-
-            // Packets received need to be written to this output stream.
-            FileOutputStream out = new FileOutputStream(iface.getFileDescriptor());
-
-            s_packet.clear();
-
-            RecvThread thr = new  RecvThread(s_in, out);
-            ret = true;
-            thr.start();
-
-            while (socket.isConnected() && connected)
-            {
-                // Assume that we did not make any progress in this iteration.
-
-                // Read the outgoing packet from the input stream.
-                int length = in.read(b_packet,2,MAX_PACKET_SIZE);
-                if(stop_thread) break;
-                if (length > 0) {
-                    // Write the outgoing packet to the tunnel.
-
-                    s_packet.putShort(0,(short)length);
-                    s_out.write(b_packet,0,length+2);
-                    s_packet.clear();
-
-                    // There might be more outgoing packets.
-
-                    //Log.i(getTag(), String.format("out %d %d",length, out_counter));
-                    out_counter ++;
-                    out_bytes += length;
-                }
-            }
-
-            Log.i(getTag(), "End... Disconnected");
+          Log.i(getTag(), "End... Disconnected");
         } catch (SocketException e) {
-            Log.e(getTag(), "Cannot use socket", e);
-            mService.iStatus = -3;
-            mService.strStatus = mService.getString(R.string.cantconnect);
-            mService.mUpdateTime = System.currentTimeMillis();
-            connected = false;
+          Log.e(getTag(), "Cannot use socket", e);
+          mService.iStatus = -3;
+          mService.strStatus = mService.getString(R.string.cantconnect);
+          mService.mUpdateTime = System.currentTimeMillis();
+          connected = false;
         } catch (SSLHandshakeException e)
         {
-            Log.e(getTag(), "Handshake error", e);
-            connected = false;
-            stop_thread = true;
+          Log.e(getTag(), "Handshake error", e);
+          connected = false;
 
+          TLStried |= (1<<workTLS);
+
+          workTLS = (workTLS + 1) & TriedMask;
+          sslSocketFactory = null;
+          if (TLStried == TriedMask)
+          {
+            Log.i(getTag(), "Handshake error " + TLStried + " workTLS =" + workTLS);
+            stop_thread = true;
             mService.mHandler.sendEmptyMessage(R.string.handshake_failed);
             msg_sendet = true;
+          }
         }
         catch (Exception e) {
-            Log.e(getTag(), "Connection closed", e);
+          Log.e(getTag(), "Connection closed", e);
         }
         finally {
-            connected = false;
-            Log.i(getTag(), "Finaly... Close all");
+          connected = false;
+          Log.i(getTag(), "Finaly... Close all");
 
-            if (iface != null) {
-                try {
-                    iface.close();
-                    iface = null;
-                } catch (IOException e) {
-                    Log.e(getTag(), "Unable to close interface", e);
-                }
+          if (iface != null) {
+            try {
+              iface.close();
+              iface = null;
+            } catch (IOException e) {
+              Log.e(getTag(), "Unable to close interface", e);
             }
-            if(sslSocket != null) {
-                sslSocket.close();
-                sslSocket = null;
+          }
+          if(sslSocket != null) {
+            sslSocket.close();
+            sslSocket = null;
+          }
+          if(socket != null ) {
+            if(! socket.isClosed() ) {
+              socket.shutdownInput();
+              socket.shutdownOutput();
+              socket.close();
             }
-            if(socket != null ) {
-                if(! socket.isClosed() ) {
-                    socket.shutdownInput();
-                    socket.shutdownOutput();
-                    socket.close();
-                }
-                socket = null;
-            }
+            socket = null;
+          }
 
         }
 
